@@ -5,7 +5,15 @@
 ## Установка / удаление
 
 ```bash
+git clone https://github.com/kichcloud/omarchy-steam-accent.git
+cd omarchy-steam-accent
 ./install.sh
+```
+
+Удаление:
+
+```bash
+cd omarchy-steam-accent
 ./uninstall.sh
 ```
 
