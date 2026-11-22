@@ -56,7 +56,7 @@ def lch_rgb(l, c, h):
 
 def rgb(h):
     h = h.lstrip("#")
-    h = h[:3] * 2 if len(h) == 3 else h[:6]
+    h = "".join(c * 2 for c in h[:3]) if len(h) == 3 else h[:6]
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 
@@ -121,41 +121,38 @@ RGB = re.compile(r"rgba?\(\s*(\d+)\s*[,\s]\s*(\d+)\s*[,\s]\s*(\d+)\s*(?:[,/]\s*(
 PROT = re.compile(r"url\([^)]*\)|\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'", re.I | re.S)
 
 
+def mapped(m, c, a, original):
+    """Перекрасить цвет, сохранив прозрачность. a=0 оставляет исходник нетронутым."""
+    if not a:
+        return original
+    n = m.map(c)
+    return "rgba(%d, %d, %d, %g)" % (*n, a) if a < .999 else hx(n)
+
+
+# Один проход: защищённые фрагменты и цвета разбираются одним regex. Раньше
+# для защиты цветов подставлялись NUL-плейсхолдеры, которые теоретически могли
+# совпасть с литералом в CSS. Теперь плейсхолдеров нет вовсе.
+TOKEN = re.compile(PROT.pattern + "|" + HEX.pattern + "|" + RGB.pattern, re.I | re.S)
+
+
 def retint(css, m):
-    keep = []
-
-    def hold(x):
-        keep.append(x.group(0))
-        return "\x00%d\x00" % (len(keep)-1)
-
-    def hexr(x):
-        h = x.group(0)[1:]
-        c = rgb(h)
-        a = int(h[6:8], 16)/255 if len(h) == 8 else 1
-        if not a:
-            return x.group(0)
-        n = m.map(c)
-        return "rgba(%d, %d, %d, %g)" % (*n, a) if a < .999 else hx(n)
-
-    def rgbg(x):
-        c = (int(x[1]), int(x[2]), int(x[3]))
+    def sub(x):
+        s = x.group(0)
+        if s[0] in "\"'" or s[:3].lower() == "url":
+            return s
+        if s[0] == "#":
+            h = s[1:]
+            a = int(h[6:8], 16)/255 if len(h) == 8 else 1
+            return mapped(m, rgb(h), a, s)
         a = float(x[4].rstrip("%"))/(100 if "%" in x[4] else 1) if x[4] else 1
-        if not a:
-            return x.group(0)
-        n = m.map(c)
-        return "rgba(%d, %d, %d, %g)" % (*n, a) if a < .999 else hx(n)
+        return mapped(m, (int(x[1]), int(x[2]), int(x[3])), a, s)
 
-    css = PROT.sub(hold, css)
-    css = HEX.sub(hexr, css)
-    css = RGB.sub(rgbg, css)
-    for i, v in enumerate(keep):
-        css = css.replace("\x00%d\x00" % i, v)
-    return css
+    return TOKEN.sub(sub, css)
 
 
-def stylesheet():
-    m = Mapper(palette())
-    sp = CSS_DIR / "sp.css"
+def build_stylesheet(m, css_dir):
+    """Собрать CSS из маппера и каталога стилей — без обращения к палитре темы."""
+    sp = css_dir / "sp.css"
     scale = {}
     if sp.is_file():
         for step, value in re.findall(r"--color-blue-(\d+)\s*:\s*(#[0-9a-fA-F]{6})", sp.read_text(errors="replace")):
@@ -172,11 +169,15 @@ def stylesheet():
               "--omarchy-accent:%s" % m.accent,
               "--omarchy-accent-rgb:%d,%d,%d" % a, "}"]
     out = ["\n".join(lines)]
-    for f in sorted(CSS_DIR.glob("*.css")):
+    for f in sorted(css_dir.glob("*.css")):
         css = retint(f.read_text(errors="replace"), m)
         if len(css) > 100:
             out.append(css)
     return "\n".join(out)
+
+
+def stylesheet():
+    return build_stylesheet(Mapper(palette()), CSS_DIR)
 
 
 class WS:
@@ -225,18 +226,21 @@ class WS:
 CHECK = "document.getElementById('omarchy-accent')?.dataset.rev||''"
 
 
-def inject(css, rev):
+def pages():
+    """CDP-цели типа page. Пустой список, если отладка в Steam не включена."""
     try:
-        targets = json.load(urllib.request.urlopen(CDP+"/json/list", timeout=2))
+        return [t for t in json.load(urllib.request.urlopen(CDP+"/json/list", timeout=2))
+                if t.get("type") == "page"]
     except Exception:
-        return 0
+        return []
+
+
+def inject(css, rev):
     apply = ("(()=>{let s=document.getElementById('omarchy-accent');if(!s){s=document.createElement('style');"
              "s.id='omarchy-accent';document.head.appendChild(s)}s.dataset.rev=%s;s.textContent=%s;return 1})()"
              % (json.dumps(rev), json.dumps(css)))
     n = 0
-    for t in targets:
-        if t.get("type") != "page":
-            continue
+    for t in pages():
         try:
             w = WS(t["webSocketDebuggerUrl"])
             if w.evaluate(CHECK) != rev:
@@ -257,23 +261,34 @@ def signature():
     return t, len(files), sum(s for _, s in files), max((m for m, _ in files), default=0)
 
 
+def refresh(css, sig):
+    """Один шаг: при необходимости собрать CSS и накатить его на вкладки Steam."""
+    s = signature()
+    if s != sig:
+        try:
+            css, sig = stylesheet(), s
+        except Exception as e:
+            print("generate failed:", e, file=sys.stderr)
+            sig = None
+    if css:
+        n = inject(css, hashlib.sha1(css.encode()).hexdigest()[:12])
+        if n:
+            print("updated", n, "target(s)", flush=True)
+    return css, sig
+
+
 def main():
     once = "--once" in sys.argv
-    FLAG.parent.mkdir(parents=True, exist_ok=True)
-    FLAG.touch()
+    try:
+        FLAG.parent.mkdir(parents=True, exist_ok=True)
+        FLAG.touch()
+    except OSError as e:
+        # Нет каталога Steam — CDP недоступен, но генерация/инъекция ещё могут
+        # сработать, если Steam уже запущен с включённой отладкой.
+        print("cannot create CDP flag:", e, file=sys.stderr)
     css, sig = "", None
     while True:
-        s = signature()
-        if s != sig:
-            try:
-                css, sig = stylesheet(), s
-            except Exception as e:
-                print("generate failed:", e, file=sys.stderr)
-                sig = None
-        if css:
-            n = inject(css, hashlib.sha1(css.encode()).hexdigest()[:12])
-            if n:
-                print("updated", n, "target(s)", flush=True)
+        css, sig = refresh(css, sig)
         if once:
             return 0
         time.sleep(5)
